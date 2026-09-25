@@ -1,0 +1,34 @@
+services:
+  transcript-align-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: transcript-align-api:latest
+    container_name: transcript-align-api
+    # 对齐大文本时 O(m*n) 反向距离表需要较多内存（约 (m+1)(n+1)*2 字节）
+    mem_limit: 2g
+    memswap_limit: 2g
+    ports:
+      # 宿主机访问 http://localhost:8000；接口为 POST /align、POST /retime、POST /locate-quote、POST /revision-diff、POST /captions 与 POST /speaker-turns
+      - "8000:8000"
+    environment:
+      # 监听端口（容器内）；与左侧宿主机映射端口保持一致
+      PORT: "8000"
+      HOST: "0.0.0.0"
+      # 输入规模上限（字符数），按可用内存调整
+      MAX_RECOGNIZED_CHARS: "20000"
+      MAX_REVISED_LENGTH: "20000"
+      MAX_QUOTE_LENGTH: "20000"
+      # 设为 0 可强制使用纯 Python 后备内核（默认优先 C 内核）
+      ALIGN_NATIVE: "1"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

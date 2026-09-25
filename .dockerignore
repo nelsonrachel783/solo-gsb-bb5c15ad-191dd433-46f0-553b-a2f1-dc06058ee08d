@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.git/
+.venv/
+venv/
+tests/
+*.md
+app/native/libalign.so
