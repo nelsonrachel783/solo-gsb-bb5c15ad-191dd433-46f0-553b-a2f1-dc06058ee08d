@@ -16,6 +16,7 @@
 - 支持 `POST /captions`：复用校时输入和逐字时间轴，按字符数/时长上限把修订文本切成字幕段。
 - 支持 `POST /speaker-turns`：复用校时输入与逐字时间轴，按重叠时长把每个修订字符归属到说话人轮次并合并成块。
 - 支持 `POST /retime`：在 `/align` 的逐字时间轴上，按 1～20 个校准点做分段线性重映射，校正整体语速偏差。
+- 支持 `POST /entity-links`：复用校时输入与逐字时间轴，按实体别名精确命中与时间桶生成采访对象的共提及关系（边权 = 共同出现的桶数）。
 - 提供 `/health` 健康检查。
 - 对齐内核为 **C（ctypes 调用）**，无编译器时自动回退**纯 Python** 实现，二者算法一致。
 
@@ -37,6 +38,7 @@ docker compose up --build -d
 - 修订差异接口：`POST http://localhost:8000/revision-diff`
 - 字幕切分接口：`POST http://localhost:8000/captions`
 - 说话人轮次归属接口：`POST http://localhost:8000/speaker-turns`
+- 实体共提及接口：`POST http://localhost:8000/entity-links`
 - 交互式文档：`http://localhost:8000/docs`（OpenAPI：`/openapi.json`）
 
 停止：
@@ -462,6 +464,88 @@ curl -X POST http://localhost:8000/speaker-turns \
 `[200,300)` 与两轮次各重叠 50 毫秒，并列时取较早的主持人；块时间取块内首字符的
 `start` 与末字符的 `end`，因此“你好”块为 `[0,300]`（跨轮次边界不影响合并）。
 
+### `POST /entity-links`
+
+在执行与 `/align` 完全相同的输入校验和逐字校时后，对 `revised_text` **逐字精确
+匹配**各实体的别名，从全部候选中选出**互不重叠**的命中集合，再按命中首字时间
+归入时间桶，生成采访对象（实体）之间的**共提及关系**。
+
+请求体包含 `/align` 的全部字段，另加：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `entities` | 数组 | 采访实体列表，数量 `2～20` |
+| `entities[].entity_id` | 字符串 | **非空**实体标识，全局唯一 |
+| `entities[].aliases` | 字符串数组 | 实体别名，`1～5` 个；每个**非空**且**全局不重复** |
+| `bucket_ms` | 整数 | 时间桶宽度（毫秒），允许 `1000～60000` |
+
+命中选择规则（依次）：
+
+1. **覆盖字符数最多**（命中区间长度之和最大）；
+2. **命中数最少**；
+3. 仍同分时，取按**（起点、终点、实体 ID）**排序的命中序列**字典序最小**者。
+
+归桶与边权：
+
+- 每个命中按**首字 `start` 整除 `bucket_ms`** 归入时间桶；同一桶内同一实体
+  只计一次；
+- 每对实体**共同出现的桶数**即为边权；只返回边权非零的边，边按实体 ID 排序，
+  边内桶下标升序；没有任何共现时 `edges` 为空列表。
+
+示例：
+
+```bash
+curl -X POST http://localhost:8000/entity-links \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "recognized": [
+      {"char":"张","start":0,"end":100},
+      {"char":"三","start":100,"end":200},
+      {"char":"和","start":200,"end":300},
+      {"char":"李","start":300,"end":400},
+      {"char":"四","start":400,"end":500},
+      {"char":"谈","start":1200,"end":1300},
+      {"char":"张","start":1300,"end":1400},
+      {"char":"三","start":1400,"end":1500},
+      {"char":"与","start":1500,"end":1600},
+      {"char":"李","start":1600,"end":1700},
+      {"char":"四","start":1700,"end":1800}
+    ],
+    "total_duration": 2000,
+    "revised_text": "张三和李四谈张三与李四",
+    "entities": [
+      {"entity_id": "张三", "aliases": ["张三"]},
+      {"entity_id": "李四", "aliases": ["李四"]}
+    ],
+    "bucket_ms": 1000
+  }'
+```
+
+响应：
+
+```json
+{
+  "hits": [
+    {"entity_id": "张三", "start_index": 0, "end_index": 2, "start": 0, "end": 200},
+    {"entity_id": "李四", "start_index": 3, "end_index": 5, "start": 300, "end": 500},
+    {"entity_id": "张三", "start_index": 6, "end_index": 8, "start": 1300, "end": 1500},
+    {"entity_id": "李四", "start_index": 9, "end_index": 11, "start": 1600, "end": 1800}
+  ],
+  "edges": [
+    {"source": "张三", "target": "李四", "weight": 2, "buckets": [0, 1]}
+  ]
+}
+```
+
+字段说明：
+
+- `hits`：按**原文顺序**返回的互不重叠命中。`start_index` / `end_index` 为命中
+  在 `revised_text` 中的半开字符区间（`end_index` 不含）；`start` / `end` 分别
+  取命中首字符时间轴的 `start` 与末字符时间轴的 `end`（毫秒）。
+- `edges`：共提及边。`source` / `target` 为一对实体 ID（按实体 ID 排序，
+  较小者在先）；`weight` 为两实体共同出现的时间桶数量；`buckets` 为共同出现的
+  桶下标（升序）。没有共现时返回 `[]`。
+
 ### 输入校验（HTTP 422）
 
 例如 `end < start`：
@@ -476,7 +560,9 @@ curl -X POST http://localhost:8000/speaker-turns \
 单字跨度超过 `max_duration_ms`，以及 `/retime` 校准点数量不在 1～20、
 `at_ms`/`corrected_ms` 未严格递增或落在开区间 `(0, total_duration)` 之外、
 `/speaker-turns` 的 `speaker_id` 为空或轮次为负时间、起止倒置、越界、
-未按起始时间排序或区间重叠等。
+未按起始时间排序或区间重叠、`/entity-links` 的实体数量不在 2～20、
+实体 ID 为空或重复、别名数量不在 1～5、别名为空或全局重复、
+`bucket_ms` 不在 1000～60000 等。
 
 ---
 
@@ -530,6 +616,7 @@ app/
   retime.py          校准点校验与分段线性重映射（旧时间 → 新时间）
   captions.py        字幕切分（段数最少 → 断点总分最高 → 字典序最小）
   speaker.py         说话人轮次归属（按重叠时长最大 → 较早轮次）与相邻同归属合并
+  entity_links.py    实体共提及（别名精确命中最优选择、时间桶归集与共现边权）
   alignment.py       内核加载（C → 即时编译 → 纯 Python）
   align_py.py        纯 Python 后备内核
   native/align_c.c   C 对齐内核源码

@@ -1182,3 +1182,313 @@ def test_speaker_turns_wrong_type_timestamp(client):
         "speaker_turns": [{"speaker_id": "A", "start": "0", "end": 50}]})
     assert r.status_code == 422
     assert "整数" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 实体共提及 POST /entity-links
+# ---------------------------------------------------------------------------
+def _entity_links(client, items, revised, entities, bucket_ms=1000, total=1000):
+    payload = {
+        "recognized": rc(items),
+        "total_duration": total,
+        "revised_text": revised,
+        "entities": entities,
+        "bucket_ms": bucket_ms,
+    }
+    return client.post("/entity-links", json=payload)
+
+
+def _ent(eid, *aliases):
+    return {"entity_id": eid, "aliases": list(aliases)}
+
+
+def test_entity_links_basic_hits_and_edge(client):
+    # 张三 [0,2) 首字 start=0、李四 [3,5) 首字 start=300，均归入桶 0
+    r = _entity_links(client, [
+        ("张", 0, 100), ("三", 100, 200), ("和", 200, 300),
+        ("李", 300, 400), ("四", 400, 500),
+    ], "张三和李四", [_ent("张三", "张三"), _ent("李四", "李四")], total=600)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "hits": [
+            {"entity_id": "张三", "start_index": 0, "end_index": 2,
+             "start": 0, "end": 200},
+            {"entity_id": "李四", "start_index": 3, "end_index": 5,
+             "start": 300, "end": 500},
+        ],
+        "edges": [
+            {"source": "张三", "target": "李四", "weight": 1, "buckets": [0]},
+        ],
+    }
+
+
+def test_entity_links_bucket_by_first_char_start(client):
+    # 李四首字 start=1500 → 桶 1，与桶 0 的张三不共现 → 空边列表
+    r = _entity_links(client, [
+        ("张", 0, 100), ("三", 100, 200),
+        ("李", 1500, 1600), ("四", 1600, 1700),
+    ], "张三李四", [_ent("张三", "张三"), _ent("李四", "李四")], total=2000)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [h["entity_id"] for h in body["hits"]] == ["张三", "李四"]
+    assert body["edges"] == []
+
+
+def test_entity_links_same_bucket_entity_counted_once(client):
+    # 张三在桶 0 内命中两次，只计一次 → 边权为 1 而非 2
+    r = _entity_links(client, [
+        ("张", 0, 100), ("三", 100, 200), ("张", 300, 400), ("三", 400, 500),
+        ("李", 600, 700), ("四", 700, 800),
+    ], "张三张三李四", [_ent("张三", "张三"), _ent("李四", "李四")])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [(h["start_index"], h["end_index"]) for h in body["hits"]] == [
+        (0, 2), (2, 4), (4, 6)]
+    assert body["edges"] == [
+        {"source": "张三", "target": "李四", "weight": 1, "buckets": [0]}]
+
+
+def test_entity_links_weight_counts_shared_buckets(client):
+    # 两实体在桶 0 与桶 2 各共现一次 → 边权 2，桶下标升序
+    r = _entity_links(client, [
+        ("张", 0, 100), ("三", 100, 200), ("李", 300, 400), ("四", 400, 500),
+        ("张", 2000, 2100), ("三", 2100, 2200),
+        ("李", 2300, 2400), ("四", 2400, 2500),
+    ], "张三李四张三李四", [_ent("张三", "张三"), _ent("李四", "李四")],
+        total=3000)
+    assert r.status_code == 200, r.text
+    assert r.json()["edges"] == [
+        {"source": "张三", "target": "李四", "weight": 2, "buckets": [0, 2]}]
+
+
+def test_entity_links_edges_sorted_by_entity_id(client):
+    # 实体按 C、A、B 顺序给出，边仍按实体 ID 排序输出
+    r = _entity_links(client, [
+        ("a", 0, 100), ("b", 100, 200), ("c", 200, 300),
+    ], "abc", [_ent("C", "c"), _ent("A", "a"), _ent("B", "b")], total=400)
+    assert r.status_code == 200, r.text
+    assert r.json()["edges"] == [
+        {"source": "A", "target": "B", "weight": 1, "buckets": [0]},
+        {"source": "A", "target": "C", "weight": 1, "buckets": [0]},
+        {"source": "B", "target": "C", "weight": 1, "buckets": [0]},
+    ]
+
+
+def test_entity_links_prefers_max_coverage_over_fewer_hits(client):
+    # {ab, c} 覆盖 3 字 2 次命中，优于任一单命中（覆盖 2 字）
+    r = _entity_links(client, [
+        ("a", 0, 100), ("b", 100, 200), ("c", 200, 300),
+    ], "abc", [_ent("A", "ab"), _ent("B", "bc", "c")], total=400)
+    assert r.status_code == 200, r.text
+    assert [(h["entity_id"], h["start_index"], h["end_index"])
+            for h in r.json()["hits"]] == [("A", 0, 2), ("B", 2, 3)]
+
+
+def test_entity_links_equal_coverage_prefers_fewer_hits(client):
+    # 单命中 abc 与双命中 ab+c 覆盖同为 3 字，取命中数更少者
+    r = _entity_links(client, [
+        ("a", 0, 100), ("b", 100, 200), ("c", 200, 300),
+    ], "abc", [_ent("A", "abc"), _ent("B", "ab", "c")], total=400)
+    assert r.status_code == 200, r.text
+    assert [(h["entity_id"], h["start_index"], h["end_index"])
+            for h in r.json()["hits"]] == [("A", 0, 3)]
+
+
+def test_entity_links_tie_prefers_earlier_start(client):
+    # ab 与 bc 重叠且覆盖、命中数相同，取起点更小者
+    r = _entity_links(client, [
+        ("a", 0, 100), ("b", 100, 200), ("c", 200, 300),
+    ], "abc", [_ent("A", "ab"), _ent("B", "bc")], total=400)
+    assert r.status_code == 200, r.text
+    assert [(h["entity_id"], h["start_index"], h["end_index"])
+            for h in r.json()["hits"]] == [("A", 0, 2)]
+
+
+def test_entity_links_tie_prefers_lexicographically_smaller_sequence(client):
+    # (0,3,X)+(3,4,W) 与 (0,2,Y)+(2,4,Z) 覆盖与命中数均相同，
+    # 按（起点、终点、实体 ID）序列字典序取后者（同起点时终点更小）
+    r = _entity_links(client, [
+        ("a", 0, 100), ("b", 100, 200), ("c", 200, 300), ("d", 300, 400),
+    ], "abcd", [
+        _ent("X", "abc"), _ent("Y", "ab"), _ent("Z", "cd"), _ent("W", "d"),
+    ], total=500)
+    assert r.status_code == 200, r.text
+    assert [(h["entity_id"], h["start_index"], h["end_index"])
+            for h in r.json()["hits"]] == [("Y", 0, 2), ("Z", 2, 4)]
+    assert r.json()["edges"] == [
+        {"source": "Y", "target": "Z", "weight": 1, "buckets": [0]}]
+
+
+def test_entity_links_alias_can_match_overlapping_occurrences(client):
+    # 别名“aa”在“aaa”中有两个重叠候选，最终选互不重叠的一个
+    r = _entity_links(client, [
+        ("a", 0, 100), ("a", 100, 200), ("a", 200, 300),
+    ], "aaa", [_ent("A", "aa"), _ent("B", "b")], total=400)
+    assert r.status_code == 200, r.text
+    assert [(h["entity_id"], h["start_index"], h["end_index"])
+            for h in r.json()["hits"]] == [("A", 0, 2)]
+
+
+def test_entity_links_uses_computed_timeline_for_inserted_chars(client):
+    # 新增字符“和”在空档 [200,900] 内推算，命中时间以其推算时间为准
+    r = _entity_links(client, [
+        ("张", 0, 100), ("三", 100, 200),
+        ("李", 900, 1000), ("四", 1000, 1100),
+    ], "张三和李四", [_ent("张三", "张三和"), _ent("李四", "李四")],
+        total=1100)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [(h["start"], h["end"]) for h in body["hits"]] == [
+        (0, 900), (900, 1100)]
+    # 张三首字 start=0 → 桶 0；李四首字 start=900 → 桶 0（900//1000）
+    assert body["edges"] == [
+        {"source": "张三", "target": "李四", "weight": 1, "buckets": [0]}]
+
+
+def test_entity_links_multiple_aliases_per_entity(client):
+    # 同一实体的多个别名均可命中，归桶时按实体去重
+    r = _entity_links(client, [
+        ("张", 0, 100), ("三", 100, 200), ("李", 300, 400), ("四", 400, 500),
+    ], "张三李四", [_ent("E1", "张三", "张"), _ent("E2", "李四")], total=600)
+    assert r.status_code == 200, r.text
+    # “张三”(0,2) 与“张”(0,1) 起点相同，覆盖更大者胜
+    assert [(h["entity_id"], h["start_index"], h["end_index"])
+            for h in r.json()["hits"]] == [("E1", 0, 2), ("E2", 2, 4)]
+
+
+def test_entity_links_empty_revised_text(client):
+    r = _entity_links(client, [], "", [_ent("A", "x"), _ent("B", "y")],
+                      total=0)
+    assert r.status_code == 200
+    assert r.json() == {"hits": [], "edges": []}
+
+
+def test_entity_links_no_alias_match_returns_empty(client):
+    r = _entity_links(client, [("你", 0, 100)], "你",
+                      [_ent("A", "甲"), _ent("B", "乙")], total=200)
+    assert r.status_code == 200
+    assert r.json() == {"hits": [], "edges": []}
+
+
+def test_entity_links_bucket_boundaries(client):
+    # 首字 start 恰为 bucket_ms 整数倍时归入该倍数的桶
+    r = _entity_links(client, [
+        ("a", 1000, 1100), ("b", 2000, 2100),
+    ], "ab", [_ent("A", "a"), _ent("B", "b")], total=3000)
+    assert r.status_code == 200, r.text
+    assert r.json()["edges"] == []  # 桶 1 与桶 2，无共现
+
+
+def test_entity_links_reuses_alignment_validation(client):
+    r = _entity_links(client, [("a", 300, 100)], "a",
+                      [_ent("A", "a"), _ent("B", "b")], total=500)
+    assert r.status_code == 422
+    assert "结束时间" in r.json()["detail"]
+
+
+def test_entity_links_entity_count_range(client):
+    one = _entity_links(client, [], "", [_ent("A", "x")], total=0)
+    assert one.status_code == 422
+    assert "2～20" in one.json()["detail"]
+    many = _entity_links(client, [], "",
+                         [_ent(f"E{i}", f"a{i}") for i in range(21)], total=0)
+    assert many.status_code == 422
+    assert "2～20" in many.json()["detail"]
+    ok = _entity_links(client, [], "",
+                       [_ent(f"E{i}", f"a{i}") for i in range(20)], total=0)
+    assert ok.status_code == 200, ok.text
+
+
+def test_entity_links_alias_count_range(client):
+    zero = _entity_links(client, [], "",
+                         [{"entity_id": "A", "aliases": []}, _ent("B", "y")],
+                         total=0)
+    assert zero.status_code == 422
+    assert "1～5" in zero.json()["detail"]
+    six = _entity_links(client, [], "",
+                        [_ent("A", "a", "b", "c", "d", "e", "f"),
+                         _ent("B", "y")], total=0)
+    assert six.status_code == 422
+    assert "1～5" in six.json()["detail"]
+
+
+def test_entity_links_empty_alias_rejected(client):
+    r = _entity_links(client, [], "",
+                      [_ent("A", ""), _ent("B", "y")], total=0)
+    assert r.status_code == 422
+    assert "非空" in r.json()["detail"]
+
+
+def test_entity_links_empty_entity_id_rejected(client):
+    r = _entity_links(client, [], "",
+                      [_ent("", "x"), _ent("B", "y")], total=0)
+    assert r.status_code == 422
+    assert "非空" in r.json()["detail"]
+
+
+def test_entity_links_duplicate_entity_id_rejected(client):
+    r = _entity_links(client, [], "",
+                      [_ent("A", "x"), _ent("A", "y")], total=0)
+    assert r.status_code == 422
+    assert "唯一" in r.json()["detail"]
+
+
+def test_entity_links_duplicate_alias_across_entities_rejected(client):
+    r = _entity_links(client, [], "",
+                      [_ent("A", "x"), _ent("B", "x")], total=0)
+    assert r.status_code == 422
+    assert "不重复" in r.json()["detail"]
+
+
+def test_entity_links_duplicate_alias_within_entity_rejected(client):
+    r = _entity_links(client, [], "",
+                      [_ent("A", "x", "x"), _ent("B", "y")], total=0)
+    assert r.status_code == 422
+    assert "不重复" in r.json()["detail"]
+
+
+def test_entity_links_bucket_ms_range(client):
+    for bad in (999, 60001):
+        r = _entity_links(client, [], "", [_ent("A", "x"), _ent("B", "y")],
+                          bucket_ms=bad, total=0)
+        assert r.status_code == 422, (bad, r.text)
+        assert "1000～60000" in r.json()["detail"]
+    for good in (1000, 60000):
+        r = _entity_links(client, [], "", [_ent("A", "x"), _ent("B", "y")],
+                          bucket_ms=good, total=0)
+        assert r.status_code == 200, (good, r.text)
+
+
+def test_entity_links_bucket_ms_wrong_type(client):
+    r = client.post("/entity-links", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "entities": [_ent("A", "x"), _ent("B", "y")], "bucket_ms": "1000"})
+    assert r.status_code == 422
+    assert "整数" in r.json()["detail"]
+
+
+def test_entity_links_missing_entities_rejected(client):
+    r = client.post("/entity-links", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "bucket_ms": 1000})
+    assert r.status_code == 422
+    assert "entities" in r.json()["detail"]
+
+
+def test_entity_links_extra_field_rejected(client):
+    r = client.post("/entity-links", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "entities": [_ent("A", "x"), _ent("B", "y")],
+        "bucket_ms": 1000, "bogus": 1})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]
+
+
+def test_entity_links_entity_extra_field_rejected(client):
+    r = client.post("/entity-links", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "entities": [{"entity_id": "A", "aliases": ["x"], "bogus": 1},
+                     _ent("B", "y")],
+        "bucket_ms": 1000})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]

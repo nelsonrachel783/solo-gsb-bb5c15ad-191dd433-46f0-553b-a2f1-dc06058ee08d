@@ -1,7 +1,9 @@
 """请求/响应数据模型。"""
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StringConstraints
 
 
 class RecognizedChar(BaseModel):
@@ -91,6 +93,31 @@ class SpeakerTurnsRequest(AlignRequest):
     )
 
 
+class EntitySpec(BaseModel):
+    """单个采访实体：全局唯一 ID 与 1～5 个非空别名。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_id: str = Field(..., min_length=1, description="全局唯一的实体标识")
+    aliases: list[Annotated[str, StringConstraints(min_length=1)]] = Field(
+        ..., min_length=1, max_length=5,
+        description="实体别名列表（1～5 个），每个非空且全局不重复",
+    )
+
+
+class EntityLinksRequest(AlignRequest):
+    """校时输入与实体共提及参数。"""
+
+    entities: list[EntitySpec] = Field(
+        ..., min_length=2, max_length=20,
+        description="采访实体列表（2～20 个）；实体 ID 唯一、别名全局不重复",
+    )
+    bucket_ms: StrictInt = Field(
+        ..., ge=1000, le=60000,
+        description="时间桶宽度（毫秒，1000～60000）",
+    )
+
+
 class RevisedCharTimeline(BaseModel):
     char: str = Field(..., description="修订文本中的字符")
     start: int = Field(..., description="起始时间（毫秒）")
@@ -169,3 +196,28 @@ class SpeakerBlock(BaseModel):
     text: str = Field(..., description="该块对应的修订文本连续文字")
     start: int = Field(..., description="块起始毫秒，取首字符时间轴的 start")
     end: int = Field(..., description="块结束毫秒，取末字符时间轴的 end")
+
+
+class EntityLinkHit(BaseModel):
+    entity_id: str = Field(..., description="命中的实体 ID")
+    start_index: int = Field(
+        ..., description="命中片段在修订文本中的起始字符下标（从 0 开始，半开区间）")
+    end_index: int = Field(
+        ..., description="命中片段在修订文本中的结束字符下标（不含该位置）")
+    start: int = Field(..., description="起始时间（毫秒），取首字符时间轴的 start")
+    end: int = Field(..., description="结束时间（毫秒），取末字符时间轴的 end")
+
+
+class EntityLinkEdge(BaseModel):
+    source: str = Field(..., description="边一端实体 ID（按实体 ID 排序的较小者）")
+    target: str = Field(..., description="边另一端实体 ID（按实体 ID 排序的较大者）")
+    weight: int = Field(..., description="两个实体共同出现的时间桶数量")
+    buckets: list[int] = Field(
+        ..., description="两个实体共同出现的时间桶下标，按升序排列")
+
+
+class EntityLinksResponse(BaseModel):
+    hits: list[EntityLinkHit] = Field(
+        ..., description="互不重叠的实体别名命中，按原文顺序返回")
+    edges: list[EntityLinkEdge] = Field(
+        ..., description="共提及边（边权非零），按实体 ID 排序；无共现为空列表")
