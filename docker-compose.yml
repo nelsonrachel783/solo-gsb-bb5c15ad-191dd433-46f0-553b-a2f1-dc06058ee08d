@@ -9,7 +9,7 @@ services:
     mem_limit: 2g
     memswap_limit: 2g
     ports:
-      # 宿主机访问 http://localhost:8000；接口为 POST /align、POST /retime、POST /locate-quote、POST /revision-diff、POST /captions 与 POST /speaker-turns
+      # 宿主机访问 http://localhost:8000；接口为 POST /align、POST /retime、POST /locate-quote、POST /revision-diff、POST /captions、POST /speaker-turns 与 POST /entity-links
       - "8000:8000"
     environment:
       # 监听端口（容器内）；与左侧宿主机映射端口保持一致

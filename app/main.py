@@ -9,12 +9,15 @@ from fastapi.responses import JSONResponse
 
 from . import alignment
 from .captions import build_captions
+from .entity import build_entity_links, validate_entities
 from .errors import InvalidTimelineError
 from .schemas import (
     AlignRequest,
     AlignResponse,
     CaptionSegment,
     CaptionsRequest,
+    EntityLinksRequest,
+    EntityLinksResponse,
     HealthResponse,
     LocateQuoteRequest,
     QuoteHit,
@@ -87,12 +90,18 @@ async def validation_handler(_request: Request,
                 range_hint = "，允许范围为 1～80"
             elif loc.endswith("max_duration_ms"):
                 range_hint = "，允许范围为 500～30000"
+            elif loc.endswith("bucket_ms"):
+                range_hint = "，允许范围为 1000～60000"
             else:
                 range_hint = ""
             messages.append(f"字段 {loc} 无效{range_hint}")
         elif etype in ("too_short", "too_long"):
             if loc.endswith("calibrations"):
                 messages.append("校准点数量无效，允许范围为 1～20 个")
+            elif loc.endswith("entities"):
+                messages.append("实体数量无效，允许范围为 2～20 个")
+            elif loc.endswith("aliases"):
+                messages.append("每个实体的别名数量无效，允许范围为 1～5 个")
             else:
                 messages.append(f"字段 {loc} 无效")
         elif etype == "extra_forbidden":
@@ -192,3 +201,16 @@ async def captions(req: CaptionsRequest) -> list[CaptionSegment]:
     timeline = build_timeline(req, alignment.backend_name())
     return build_captions(
         req.revised_text, timeline["chars"], req.max_chars, req.max_duration_ms)
+
+
+@app.post(
+    "/entity-links",
+    response_model=EntityLinksResponse,
+    tags=["实体共现"],
+)
+async def entity_links(req: EntityLinksRequest) -> EntityLinksResponse:
+    """精确匹配实体别名，按时间桶生成采访对象的共提及关系。"""
+    validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
+    validate_entities(req)
+    timeline = build_timeline(req, alignment.backend_name())
+    return build_entity_links(req, timeline["chars"])
